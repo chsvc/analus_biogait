@@ -85,6 +85,9 @@ def validate_data(df: pd.DataFrame) -> dict:
         "missing_columns": [],
         "duplicate_frames": 0,
         "duplicate_frame_ratio": 0.0,
+        "frame_non_numeric_count": 0,
+        "frame_missing_count": 0,
+        "frame_is_monotonic": True,
         "non_numeric_counts": {},
         "missing_value_counts": {},
         "missing_ratios": {},
@@ -100,7 +103,26 @@ def validate_data(df: pd.DataFrame) -> dict:
         validation["errors"].append(f"Missing required columns: {missing_cols}")
         return validation
 
-    duplicate_frames = int(df[FRAME_COL].duplicated().sum())
+    frame_numeric = pd.to_numeric(df[FRAME_COL], errors="coerce")
+    frame_non_numeric = int(frame_numeric.isna().sum() - df[FRAME_COL].isna().sum())
+    frame_missing = int(frame_numeric.isna().sum())
+    validation["frame_non_numeric_count"] = max(0, frame_non_numeric)
+    validation["frame_missing_count"] = frame_missing
+
+    if frame_non_numeric > 0:
+        validation["warnings"].append(
+            f"Frame column has {frame_non_numeric} non-numeric values coerced to NaN."
+        )
+
+    frame_original_order = frame_numeric.dropna()
+    frame_is_monotonic = bool(frame_original_order.is_monotonic_increasing)
+    validation["frame_is_monotonic"] = frame_is_monotonic
+    if not frame_is_monotonic:
+        validation["warnings"].append(
+            "Frame values are not monotonic in original input order; temporal ordering may be inconsistent."
+        )
+
+    duplicate_frames = int(frame_numeric.dropna().duplicated().sum())
     validation["duplicate_frames"] = duplicate_frames
     frame_count = max(len(df), 1)
     duplicate_ratio = duplicate_frames / frame_count
@@ -210,6 +232,7 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
         metrics.append({"metric": f"{col} | ROM", "value": rom})
         metrics.append({"metric": f"{col} | mean_abs_frame_change", "value": smoothness})
 
+    global_pct_asymmetry_values: List[float] = []
     for joint, (left_col, right_col) in LR_PAIRS.items():
         left = df[left_col].astype(float)
         right = df[right_col].astype(float)
@@ -223,6 +246,7 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
             pct_diff_of_means = np.nan
         else:
             pct_diff_of_means = abs_diff_of_means / abs(denom_global) * 100.0
+            global_pct_asymmetry_values.append(float(pct_diff_of_means))
 
         framewise_abs_diff = (left - right).abs()
         framewise_denom = ((left + right) / 2.0).abs().replace(0, np.nan)
@@ -253,6 +277,17 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
                 "value": float(framewise_pct_diff.dropna().mean()) if framewise_pct_diff.notna().any() else np.nan,
             }
         )
+
+    if global_pct_asymmetry_values:
+        symmetry_score = max(0.0, 100.0 - float(np.mean(global_pct_asymmetry_values)))
+    else:
+        symmetry_score = np.nan
+    metrics.append(
+        {
+            "metric": "GLOBAL symmetry | score_0_to_100",
+            "value": float(symmetry_score) if np.isfinite(symmetry_score) else np.nan,
+        }
+    )
 
     step_width = df[STEP_WIDTH_COL].astype(float)
     sw_mean = float(step_width.mean())
@@ -553,6 +588,15 @@ def generate_report(
             if np.isfinite(pct_val)
             else f"- {joint}: abs_difference_of_means={abs_val:.4f}, pct_difference_of_means=NaN"
         )
+    symmetry_score = _get_metric_value(metrics_df, "GLOBAL symmetry | score_0_to_100")
+    lines.append(
+        f"- GLOBAL symmetry | score_0_to_100={symmetry_score:.4f}"
+        if np.isfinite(symmetry_score)
+        else "- GLOBAL symmetry | score_0_to_100=NaN"
+    )
+    lines.append(
+        "- Note: percentage asymmetry can become unstable when the underlying bilateral mean signal is near zero."
+    )
 
     lines.append("")
     lines.append("## Framewise Asymmetry Metrics")
@@ -578,16 +622,14 @@ def generate_report(
             f"- {col}: jump_count={details.get('jump_count', 0)}, "
             f"threshold={details.get('threshold', np.nan):.4f}, method={details.get('method', 'unknown')}"
         )
-    for item in instability.get("summary", []):
-        lines.append(f"- {item}")
+    lines.append("- Summary: see per-signal jump counts above for detailed instability findings.")
 
     lines.append("")
     lines.append("## Outlier Counts")
     lines.append(f"- Robust z threshold: {outliers.get('threshold', OUTLIER_ROBUST_Z_THRESHOLD):.2f}")
     for col, details in outliers.get("signals", {}).items():
         lines.append(f"- {col}: outlier_count={details.get('count', 0)} (method={details.get('method', 'unknown')})")
-    for item in outliers.get("summary", []):
-        lines.append(f"- {item}")
+    lines.append("- Summary: outlier findings are reported per signal above.")
 
     lines.append("")
     lines.append("## Technical Interpretation")
@@ -630,6 +672,10 @@ def main() -> None:
     clean_df = preprocess_data(raw_df)
     if clean_df.empty:
         raise ValueError("No usable data after preprocessing.")
+    if len(clean_df) < MIN_REQUIRED_ROWS:
+        raise ValueError(
+            f"Too few usable rows after preprocessing ({len(clean_df)} < {MIN_REQUIRED_ROWS})."
+        )
 
     smoothed_df = smooth_signals(clean_df)
     metrics_df = compute_metrics(clean_df)
