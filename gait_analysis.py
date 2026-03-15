@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,10 +33,23 @@ ROLLING_WINDOW = 5
 ASYMMETRY_PERCENT_THRESHOLD = 15.0
 STEP_WIDTH_CV_THRESHOLD = 20.0
 INSTABILITY_MAD_MULTIPLIER = 6.0
+INSTABILITY_FALLBACK_MULTIPLIER = 3.0
+
+MAX_MISSING_RATIO = 0.3
+MIN_REQUIRED_ROWS = 10
+OUTLIER_ROBUST_Z_THRESHOLD = 3.5
+SEVERE_DUPLICATE_FRAME_RATIO = 0.5
 
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 LOGGER = logging.getLogger(__name__)
+
+
+LR_PAIRS: Dict[str, Tuple[str, str]] = {
+    "HIP": ("LEFT HIP (degrees)", "RIGHT HIP (degrees)"),
+    "KNEE": ("LEFT KNEE (degrees)", "RIGHT KNEE (degrees)"),
+    "ANKLE": ("LEFT ANKLE (degrees)", "RIGHT ANKLE (degrees)"),
+}
 
 
 def load_data(input_file: str) -> pd.DataFrame:
@@ -63,7 +76,7 @@ def load_data(input_file: str) -> pd.DataFrame:
 
 
 def validate_data(df: pd.DataFrame) -> dict:
-    """Validate schema, duplicates, and numeric convertibility."""
+    """Validate schema and data quality for reliable downstream analysis."""
     validation = {
         "is_valid": True,
         "errors": [],
@@ -71,8 +84,13 @@ def validate_data(df: pd.DataFrame) -> dict:
         "row_count": len(df),
         "missing_columns": [],
         "duplicate_frames": 0,
+        "duplicate_frame_ratio": 0.0,
         "non_numeric_counts": {},
         "missing_value_counts": {},
+        "missing_ratios": {},
+        "max_missing_ratio_allowed": MAX_MISSING_RATIO,
+        "min_required_rows": MIN_REQUIRED_ROWS,
+        "valid_rows_after_coercion": 0,
     }
 
     missing_cols = [c for c in REQUIRED_COLUMNS if c not in df.columns]
@@ -84,20 +102,52 @@ def validate_data(df: pd.DataFrame) -> dict:
 
     duplicate_frames = int(df[FRAME_COL].duplicated().sum())
     validation["duplicate_frames"] = duplicate_frames
+    frame_count = max(len(df), 1)
+    duplicate_ratio = duplicate_frames / frame_count
+    validation["duplicate_frame_ratio"] = duplicate_ratio
     if duplicate_frames > 0:
         validation["warnings"].append(
-            f"Found {duplicate_frames} duplicated frame index values."
+            f"Found {duplicate_frames} duplicated frame index values ({duplicate_ratio:.1%})."
         )
+        if duplicate_ratio > SEVERE_DUPLICATE_FRAME_RATIO:
+            validation["is_valid"] = False
+            validation["errors"].append(
+                "Duplicate frame ratio is too high for stable temporal analysis."
+            )
 
+    coerced_df = df.copy()
     for col in REQUIRED_COLUMNS:
-        coerced = pd.to_numeric(df[col], errors="coerce")
-        invalid_count = int(coerced.isna().sum() - df[col].isna().sum())
+        coerced = pd.to_numeric(coerced_df[col], errors="coerce")
+        invalid_count = int(coerced.isna().sum() - coerced_df[col].isna().sum())
+        missing_count = int(coerced.isna().sum())
+        missing_ratio = float(missing_count / frame_count)
+
+        validation["non_numeric_counts"][col] = max(0, invalid_count)
+        validation["missing_value_counts"][col] = missing_count
+        validation["missing_ratios"][col] = missing_ratio
+
         if invalid_count > 0:
             validation["warnings"].append(
                 f"Column '{col}' has {invalid_count} non-numeric values coerced to NaN."
             )
-        validation["non_numeric_counts"][col] = max(0, invalid_count)
-        validation["missing_value_counts"][col] = int(coerced.isna().sum())
+
+        if missing_ratio > MAX_MISSING_RATIO:
+            validation["is_valid"] = False
+            validation["errors"].append(
+                f"Column '{col}' exceeds missing/invalid threshold "
+                f"({missing_ratio:.1%} > {MAX_MISSING_RATIO:.1%})."
+            )
+
+        coerced_df[col] = coerced
+
+    valid_rows_mask = coerced_df[REQUIRED_COLUMNS].notna().all(axis=1)
+    valid_rows_after_coercion = int(valid_rows_mask.sum())
+    validation["valid_rows_after_coercion"] = valid_rows_after_coercion
+    if valid_rows_after_coercion < MIN_REQUIRED_ROWS:
+        validation["is_valid"] = False
+        validation["errors"].append(
+            f"Too few valid rows after coercion ({valid_rows_after_coercion} < {MIN_REQUIRED_ROWS})."
+        )
 
     if validation["row_count"] == 0:
         validation["is_valid"] = False
@@ -119,7 +169,7 @@ def _smooth_series(series: pd.Series) -> pd.Series:
 
 
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort, de-duplicate, coerce numerics, impute missing values, and smooth signals."""
+    """Sort, de-duplicate, coerce numerics, and impute missing values (no smoothing)."""
     proc = df.copy()
 
     for col in REQUIRED_COLUMNS:
@@ -132,10 +182,16 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     proc[numeric_cols] = proc[numeric_cols].interpolate(method="linear", limit_direction="both")
     proc[numeric_cols] = proc[numeric_cols].ffill().bfill()
 
-    for col in numeric_cols:
-        proc[col] = _smooth_series(proc[col])
-
     return proc
+
+
+def smooth_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Create plot-ready smoothed signals; keeps step width unsmoothed to preserve variability."""
+    smoothed = df.copy()
+    for col in ANGLE_COLUMNS:
+        smoothed[col] = _smooth_series(smoothed[col].astype(float))
+    # STEP WIDTH is intentionally left unchanged because its variability is itself informative.
+    return smoothed
 
 
 def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -154,27 +210,47 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
         metrics.append({"metric": f"{col} | ROM", "value": rom})
         metrics.append({"metric": f"{col} | mean_abs_frame_change", "value": smoothness})
 
-    lr_pairs = {
-        "HIP": ("LEFT HIP (degrees)", "RIGHT HIP (degrees)"),
-        "KNEE": ("LEFT KNEE (degrees)", "RIGHT KNEE (degrees)"),
-        "ANKLE": ("LEFT ANKLE (degrees)", "RIGHT ANKLE (degrees)"),
-    }
-
-    for joint, (left_col, right_col) in lr_pairs.items():
+    for joint, (left_col, right_col) in LR_PAIRS.items():
         left = df[left_col].astype(float)
         right = df[right_col].astype(float)
-        abs_diff = (left - right).abs()
-        denom = ((left.abs() + right.abs()) / 2.0).replace(0, np.nan)
-        pct_diff = (abs_diff / denom) * 100.0
-        pct_diff = pct_diff.replace([np.inf, -np.inf], np.nan)
+
+        left_mean = float(left.mean())
+        right_mean = float(right.mean())
+        abs_diff_of_means = abs(left_mean - right_mean)
+
+        denom_global = (left_mean + right_mean) / 2.0
+        if denom_global == 0:
+            pct_diff_of_means = np.nan
+        else:
+            pct_diff_of_means = abs_diff_of_means / abs(denom_global) * 100.0
+
+        framewise_abs_diff = (left - right).abs()
+        framewise_denom = ((left + right) / 2.0).abs().replace(0, np.nan)
+        framewise_pct_diff = (framewise_abs_diff / framewise_denom) * 100.0
+        framewise_pct_diff = framewise_pct_diff.replace([np.inf, -np.inf], np.nan)
 
         metrics.append(
-            {"metric": f"{joint} asymmetry | abs_mean_difference", "value": float(abs_diff.mean())}
+            {
+                "metric": f"{joint} asymmetry | abs_difference_of_means",
+                "value": float(abs_diff_of_means),
+            }
         )
         metrics.append(
             {
-                "metric": f"{joint} asymmetry | pct_mean_difference",
-                "value": float(pct_diff.dropna().mean()) if pct_diff.notna().any() else np.nan,
+                "metric": f"{joint} asymmetry | pct_difference_of_means",
+                "value": float(pct_diff_of_means) if np.isfinite(pct_diff_of_means) else np.nan,
+            }
+        )
+        metrics.append(
+            {
+                "metric": f"{joint} asymmetry | mean_framewise_abs_difference",
+                "value": float(framewise_abs_diff.mean()),
+            }
+        )
+        metrics.append(
+            {
+                "metric": f"{joint} asymmetry | mean_framewise_pct_difference",
+                "value": float(framewise_pct_diff.dropna().mean()) if framewise_pct_diff.notna().any() else np.nan,
             }
         )
 
@@ -182,13 +258,18 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     sw_mean = float(step_width.mean())
     sw_std = float(step_width.std(ddof=1)) if len(step_width) > 1 else 0.0
     sw_cv = (sw_std / sw_mean * 100.0) if sw_mean != 0 else np.nan
-    metrics.append({"metric": "STEP WIDTH | coefficient_of_variation_pct", "value": float(sw_cv) if not np.isnan(sw_cv) else np.nan})
+    metrics.append(
+        {
+            "metric": "STEP WIDTH | coefficient_of_variation_pct",
+            "value": float(sw_cv) if np.isfinite(sw_cv) else np.nan,
+        }
+    )
 
     return pd.DataFrame(metrics)
 
 
 def detect_asymmetry(metrics_df: pd.DataFrame) -> dict:
-    """Flag unusually high bilateral asymmetry based on percentage thresholds."""
+    """Flag unusually high bilateral asymmetry based on global percentage thresholds."""
     results = {
         "threshold_pct": ASYMMETRY_PERCENT_THRESHOLD,
         "flags": {},
@@ -196,27 +277,43 @@ def detect_asymmetry(metrics_df: pd.DataFrame) -> dict:
     }
 
     for joint in ["HIP", "KNEE", "ANKLE"]:
-        metric_name = f"{joint} asymmetry | pct_mean_difference"
-        row = metrics_df.loc[metrics_df["metric"] == metric_name, "value"]
-        value = float(row.iloc[0]) if not row.empty else np.nan
-        is_flagged = bool(np.isfinite(value) and value > ASYMMETRY_PERCENT_THRESHOLD)
+        global_metric_name = f"{joint} asymmetry | pct_difference_of_means"
+        framewise_metric_name = f"{joint} asymmetry | mean_framewise_pct_difference"
+
+        global_row = metrics_df.loc[metrics_df["metric"] == global_metric_name, "value"]
+        framewise_row = metrics_df.loc[metrics_df["metric"] == framewise_metric_name, "value"]
+
+        global_pct = float(global_row.iloc[0]) if not global_row.empty else np.nan
+        framewise_pct = float(framewise_row.iloc[0]) if not framewise_row.empty else np.nan
+
+        is_flagged = bool(np.isfinite(global_pct) and global_pct > ASYMMETRY_PERCENT_THRESHOLD)
         results["flags"][joint] = {
-            "pct_mean_difference": value,
+            "pct_difference_of_means": global_pct,
+            "mean_framewise_pct_difference": framewise_pct,
             "flagged": is_flagged,
         }
         if is_flagged:
             results["summary"].append(
-                f"{joint} asymmetry exceeds threshold ({value:.2f}% > {ASYMMETRY_PERCENT_THRESHOLD:.2f}%)."
+                f"{joint} global asymmetry exceeds threshold ({global_pct:.2f}% > {ASYMMETRY_PERCENT_THRESHOLD:.2f}%)."
             )
 
     if not results["summary"]:
-        results["summary"].append("No asymmetry metrics exceeded configured thresholds.")
+        results["summary"].append("No global asymmetry metrics exceeded configured thresholds.")
 
     return results
 
 
+def _fallback_instability_threshold(diffs: pd.Series, median_diff: float) -> float:
+    """Fallback threshold when MAD is zero or unavailable."""
+    if diffs.empty:
+        return np.nan
+    p95 = float(np.percentile(diffs, 95))
+    scale = max(median_diff, float(diffs.mean()), 1e-6)
+    return max(p95, median_diff + INSTABILITY_FALLBACK_MULTIPLIER * scale)
+
+
 def detect_signal_instability(df: pd.DataFrame) -> dict:
-    """Detect abrupt jumps via robust first-difference thresholds and step-width instability."""
+    """Detect abrupt jumps on clean (non-smoothed) signals and step-width variability."""
     instability = {
         "abrupt_jumps": {},
         "step_width_cv_pct": np.nan,
@@ -231,6 +328,7 @@ def detect_signal_instability(df: pd.DataFrame) -> dict:
         if diffs.empty:
             instability["abrupt_jumps"][col] = {
                 "threshold": np.nan,
+                "method": "insufficient_data",
                 "jump_count": 0,
                 "jump_frames": [],
             }
@@ -238,15 +336,21 @@ def detect_signal_instability(df: pd.DataFrame) -> dict:
 
         med = float(np.median(diffs))
         mad = float(np.median(np.abs(diffs - med)))
-        robust_sigma = 1.4826 * mad
-        threshold = med + INSTABILITY_MAD_MULTIPLIER * robust_sigma
+        if mad > 0:
+            robust_sigma = 1.4826 * mad
+            threshold = med + INSTABILITY_MAD_MULTIPLIER * robust_sigma
+            method = "mad_based"
+        else:
+            threshold = _fallback_instability_threshold(diffs, med)
+            method = "fallback_non_mad"
 
         jump_mask = diffs > threshold
-        jump_frames = df.loc[jump_mask.index[jump_mask], FRAME_COL].astype(int).tolist()
+        jump_frames = df.loc[jump_mask.index[jump_mask], FRAME_COL].tolist()
         jump_count = int(jump_mask.sum())
 
         instability["abrupt_jumps"][col] = {
-            "threshold": float(threshold),
+            "threshold": float(threshold) if np.isfinite(threshold) else np.nan,
+            "method": method,
             "jump_count": jump_count,
             "jump_frames": jump_frames,
         }
@@ -269,6 +373,53 @@ def detect_signal_instability(df: pd.DataFrame) -> dict:
         instability["summary"].append("No instability flags triggered under current thresholds.")
 
     return instability
+
+
+def detect_outliers(df: pd.DataFrame) -> dict:
+    """Flag conservative outliers per signal using robust z-scores without removing points."""
+    outliers = {
+        "threshold": OUTLIER_ROBUST_Z_THRESHOLD,
+        "signals": {},
+        "summary": [],
+    }
+
+    signal_cols = [*ANGLE_COLUMNS, STEP_WIDTH_COL]
+    for col in signal_cols:
+        series = df[col].astype(float)
+        median = float(series.median())
+        mad = float(np.median(np.abs(series - median)))
+
+        if mad > 0:
+            robust_z = 0.6745 * (series - median) / mad
+            mask = robust_z.abs() > OUTLIER_ROBUST_Z_THRESHOLD
+            method = "mad_robust_z"
+        else:
+            q1 = float(series.quantile(0.25))
+            q3 = float(series.quantile(0.75))
+            iqr = q3 - q1
+            if iqr > 0:
+                lower = q1 - 1.5 * iqr
+                upper = q3 + 1.5 * iqr
+                mask = (series < lower) | (series > upper)
+                method = "iqr_fallback"
+            else:
+                mask = pd.Series(False, index=series.index)
+                method = "no_variation"
+
+        count = int(mask.sum())
+        outlier_frames = df.loc[mask, FRAME_COL].tolist()
+        outliers["signals"][col] = {
+            "method": method,
+            "count": count,
+            "frames": outlier_frames,
+        }
+        if count > 0:
+            outliers["summary"].append(f"{col}: {count} outlier frame(s) flagged.")
+
+    if not outliers["summary"]:
+        outliers["summary"].append("No conservative outlier flags were triggered.")
+
+    return outliers
 
 
 def _plot_pair(df: pd.DataFrame, left_col: str, right_col: str, title: str, ylabel: str, output_file: Path) -> None:
@@ -326,19 +477,33 @@ def plot_signals(df: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
+def _get_metric_value(metrics_df: pd.DataFrame, metric_name: str) -> float:
+    """Safely fetch a scalar metric value from long-format metric table."""
+    row = metrics_df.loc[metrics_df["metric"] == metric_name, "value"]
+    return float(row.iloc[0]) if not row.empty else np.nan
+
+
 def generate_report(
     validation: dict,
     metrics_df: pd.DataFrame,
     asymmetry: dict,
     instability: dict,
+    outliers: dict,
 ) -> str:
-    """Create a conservative technical markdown report without clinical diagnosis."""
+    """Create a cautious markdown report with technical (non-diagnostic) interpretation."""
     lines: List[str] = []
     lines.append("# Gait Analysis Report")
     lines.append("")
-    lines.append("## Data Validation")
-    lines.append(f"- Rows processed: {validation.get('row_count', 0)}")
-    lines.append(f"- Duplicate frames detected: {validation.get('duplicate_frames', 0)}")
+    lines.append("## Dataset Summary")
+    lines.append(f"- Rows in input dataset: {validation.get('row_count', 0)}")
+    lines.append(f"- Valid rows after numeric coercion: {validation.get('valid_rows_after_coercion', 0)}")
+    lines.append(f"- Duplicate frames: {validation.get('duplicate_frames', 0)}")
+
+    lines.append("")
+    lines.append("## Validation Summary")
+    lines.append(f"- Validation status: {'PASS' if validation.get('is_valid') else 'FAIL'}")
+    lines.append(f"- Maximum allowed missing/invalid ratio: {validation.get('max_missing_ratio_allowed', MAX_MISSING_RATIO):.0%}")
+    lines.append(f"- Minimum required valid rows: {validation.get('min_required_rows', MIN_REQUIRED_ROWS)}")
 
     if validation.get("errors"):
         lines.append("- Errors:")
@@ -352,22 +517,53 @@ def generate_report(
         lines.append("- No validation issues detected.")
 
     lines.append("")
-    lines.append("## Key Metrics")
+    lines.append("## Joint Descriptive Metrics")
+    for joint, (left_col, right_col) in LR_PAIRS.items():
+        lines.append(f"### {joint}")
+        for side_label, col in [("Left", left_col), ("Right", right_col)]:
+            mean_v = _get_metric_value(metrics_df, f"{col} | mean")
+            std_v = _get_metric_value(metrics_df, f"{col} | std")
+            min_v = _get_metric_value(metrics_df, f"{col} | min")
+            max_v = _get_metric_value(metrics_df, f"{col} | max")
+            rom_v = _get_metric_value(metrics_df, f"{col} | ROM")
+            lines.append(
+                f"- {side_label}: mean={mean_v:.4f}, std={std_v:.4f}, min={min_v:.4f}, max={max_v:.4f}, ROM={rom_v:.4f}"
+            )
 
-    key_metrics = [
-        "HIP asymmetry | abs_mean_difference",
-        "HIP asymmetry | pct_mean_difference",
-        "KNEE asymmetry | abs_mean_difference",
-        "KNEE asymmetry | pct_mean_difference",
-        "ANKLE asymmetry | abs_mean_difference",
-        "ANKLE asymmetry | pct_mean_difference",
+    lines.append("")
+    lines.append("## Step Width Metrics")
+    for metric_name in [
+        f"{STEP_WIDTH_COL} | mean",
+        f"{STEP_WIDTH_COL} | std",
+        f"{STEP_WIDTH_COL} | min",
+        f"{STEP_WIDTH_COL} | max",
+        f"{STEP_WIDTH_COL} | ROM",
         "STEP WIDTH | coefficient_of_variation_pct",
-    ]
-    for metric_name in key_metrics:
-        row = metrics_df.loc[metrics_df["metric"] == metric_name, "value"]
-        if not row.empty:
-            value = row.iloc[0]
-            lines.append(f"- {metric_name}: {value:.4f}" if np.isfinite(value) else f"- {metric_name}: NaN")
+    ]:
+        value = _get_metric_value(metrics_df, metric_name)
+        lines.append(f"- {metric_name}: {value:.4f}" if np.isfinite(value) else f"- {metric_name}: NaN")
+
+    lines.append("")
+    lines.append("## Global Asymmetry Metrics (Difference of Means)")
+    for joint in ["HIP", "KNEE", "ANKLE"]:
+        abs_val = _get_metric_value(metrics_df, f"{joint} asymmetry | abs_difference_of_means")
+        pct_val = _get_metric_value(metrics_df, f"{joint} asymmetry | pct_difference_of_means")
+        lines.append(
+            f"- {joint}: abs_difference_of_means={abs_val:.4f}, pct_difference_of_means={pct_val:.4f}%"
+            if np.isfinite(pct_val)
+            else f"- {joint}: abs_difference_of_means={abs_val:.4f}, pct_difference_of_means=NaN"
+        )
+
+    lines.append("")
+    lines.append("## Framewise Asymmetry Metrics")
+    for joint in ["HIP", "KNEE", "ANKLE"]:
+        abs_val = _get_metric_value(metrics_df, f"{joint} asymmetry | mean_framewise_abs_difference")
+        pct_val = _get_metric_value(metrics_df, f"{joint} asymmetry | mean_framewise_pct_difference")
+        lines.append(
+            f"- {joint}: mean_framewise_abs_difference={abs_val:.4f}, mean_framewise_pct_difference={pct_val:.4f}%"
+            if np.isfinite(pct_val)
+            else f"- {joint}: mean_framewise_abs_difference={abs_val:.4f}, mean_framewise_pct_difference=NaN"
+        )
 
     lines.append("")
     lines.append("## Asymmetry Flags")
@@ -375,17 +571,34 @@ def generate_report(
         lines.append(f"- {item}")
 
     lines.append("")
-    lines.append("## Signal Instability Flags")
+    lines.append("## Instability Findings")
+    lines.append(f"- Step width CV (%): {instability.get('step_width_cv_pct', np.nan):.4f}")
+    for col, details in instability.get("abrupt_jumps", {}).items():
+        lines.append(
+            f"- {col}: jump_count={details.get('jump_count', 0)}, "
+            f"threshold={details.get('threshold', np.nan):.4f}, method={details.get('method', 'unknown')}"
+        )
     for item in instability.get("summary", []):
+        lines.append(f"- {item}")
+
+    lines.append("")
+    lines.append("## Outlier Counts")
+    lines.append(f"- Robust z threshold: {outliers.get('threshold', OUTLIER_ROBUST_Z_THRESHOLD):.2f}")
+    for col, details in outliers.get("signals", {}).items():
+        lines.append(f"- {col}: outlier_count={details.get('count', 0)} (method={details.get('method', 'unknown')})")
+    for item in outliers.get("summary", []):
         lines.append(f"- {item}")
 
     lines.append("")
     lines.append("## Technical Interpretation")
     lines.append(
-        "- This report provides technical signal-based descriptors (distribution, variability, symmetry, and temporal smoothness) only."
+        "- This report provides technical signal descriptors (distribution, variability, asymmetry, and abrupt temporal changes) from the provided kinematic data."
     )
     lines.append(
-        "- Findings should be interpreted in context of acquisition conditions and measurement uncertainty; this script does not perform diagnosis."
+        "- Metrics are sensitive to capture quality, preprocessing choices, and coordinate definitions; interpret in acquisition context."
+    )
+    lines.append(
+        "- Non-diagnostic disclaimer: this script does not provide medical diagnosis, clinical classification, or treatment recommendations."
     )
 
     return "\n".join(lines) + "\n"
@@ -418,13 +631,15 @@ def main() -> None:
     if clean_df.empty:
         raise ValueError("No usable data after preprocessing.")
 
+    smoothed_df = smooth_signals(clean_df)
     metrics_df = compute_metrics(clean_df)
     asymmetry = detect_asymmetry(metrics_df)
     instability = detect_signal_instability(clean_df)
+    outliers = detect_outliers(clean_df)
 
     output_dir = Path(OUTPUT_DIR)
-    plot_signals(clean_df, output_dir)
-    report_text = generate_report(validation, metrics_df, asymmetry, instability)
+    plot_signals(smoothed_df, output_dir)
+    report_text = generate_report(validation, metrics_df, asymmetry, instability, outliers)
     save_results(metrics_df, report_text, output_dir)
 
     LOGGER.info("Analysis complete. Outputs saved to %s", output_dir.resolve())
